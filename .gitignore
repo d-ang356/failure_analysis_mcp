@@ -409,6 +409,7 @@ $RECYCLE.BIN/
 .env.production.local
 .env.local
 
+.idea
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pycharm,intellij,windows,linux
 
