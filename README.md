@@ -25,7 +25,7 @@ This server provides intelligent failure analysis for WebdriverIO E2E tests by:
 
 - Python 3.11+
 - [UV](https://docs.astral.sh/uv/) for package management
-- [Ollama](https://ollama.ai/) with a code model (e.g., `qwen2.5-coder:7b`)
+- [Ollama](https://ollama.ai/) with a vision-capable model (e.g., `gemma4:e4b`)
 
 ### Setup
 
@@ -47,7 +47,7 @@ cp .env.example .env
 
 4. Ensure Ollama is running with your chosen model:
 ```bash
-ollama pull qwen2.5-coder:7b
+ollama pull gemma4:e4b
 ollama serve
 ```
 
@@ -65,9 +65,9 @@ All configuration is done via environment variables in `.env`:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MCP_OLLAMA_HOST` | `http://localhost:11434` | Ollama server host |
-| `MCP_OLLAMA_MODEL` | `qwen2.5-coder:7b` | Model to use for analysis |
+| `MCP_OLLAMA_MODEL` | `gemma4:e4b` | Model to use for analysis (vision-capable recommended) |
 | `MCP_OLLAMA_TEMPERATURE` | `0.1` | Temperature (0.0-1.0) |
-| `MCP_OLLAMA_NUM_CTX` | `32768` | Context window size |
+| `MCP_OLLAMA_NUM_CTX` | `131072` | Context window size |
 | `MCP_OLLAMA_TIMEOUT` | `300` | Request timeout in seconds |
 
 ### Analysis Settings
@@ -75,6 +75,7 @@ All configuration is done via environment variables in `.env`:
 |----------|---------|-------------|
 | `MCP_MAX_IMPORT_DEPTH` | `3` | How many levels of imports to traverse |
 | `MCP_MAX_FILE_SIZE_KB` | `500` | Max file size to analyze |
+| `MCP_MAX_DOM_SIZE_KB` | `100` | Max DOM snapshot size after cleaning |
 | `MCP_SESSION_TTL_MINUTES` | `60` | Session expiration time |
 | `MCP_MAX_SESSION_HISTORY` | `10` | Failures to keep per session |
 
@@ -108,12 +109,15 @@ uv run mcp-server
 The server exposes these MCP tools:
 
 #### `analyze_failure`
-Analyzes a WebdriverIO test failure.
+Analyzes a WebdriverIO test failure with optional visual and DOM context.
 
 **Parameters:**
-- `console_output` (string): Raw console output from test run
+- `console_output` (string): Raw console output from test run (supports ndjson)
 - `spec_file_path` (string): Absolute path to the failing spec file
 - `session_id` (string, optional): Session ID for maintaining context
+- `screenshot_base64` (string, optional): Base64-encoded screenshot of the page at failure time
+- `dom_snapshot` (string, optional): Full DOM snapshot or accessibility tree of the page
+- `screenshot_mime_type` (string, optional): MIME type of the screenshot (default `image/png`)
 
 **Returns:** JSON with `success`, `analysis`, `session_id`, `model`, `files_analyzed`
 
@@ -228,9 +232,15 @@ Cannot connect to Ollama at http://localhost:11434
 
 ### Model Not Found
 ```
-Model qwen2.5-coder:7b not found
+Model gemma4:e4b not found
 ```
-**Solution:** Pull the model: `ollama pull qwen2.5-coder:7b`
+**Solution:** Pull the model: `ollama pull gemma4:e4b`
+
+### Screenshot Not Analyzed
+If the LLM does not reference the screenshot in its analysis:
+- Verify the model supports vision (`ollama show gemma4:e4b` should list `vision` in capabilities)
+- Text-only models (`qwen2.5-coder:7b`) cannot process images
+- Ensure `screenshot_base64` is a valid base64 string
 
 ### Import Resolution Failures
 If imports aren't being resolved:
@@ -241,13 +251,23 @@ If imports aren't being resolved:
 ### Session Expiration
 Sessions expire after `MCP_SESSION_TTL_MINUTES` of inactivity. Increase this value for long-running analysis sessions.
 
+### Large DOM Snapshots
+If DOM snapshots cause context window overflows:
+- Reduce `MCP_MAX_DOM_SIZE_KB` (default 100KB)
+- Strip scripts/styles client-side before sending
+- Send an accessibility tree instead of full HTML
+
 ## Integration with WebdriverIO
 
 The server is designed to work with a WebdriverIO MCP client. The client should:
 
 1. Start the MCP server as a subprocess
 2. Communicate via stdio using MCP protocol
-3. Send `analyze_failure` tool calls with console output
+3. Send `analyze_failure` tool calls with:
+   - Console output (raw text or ndjson lines)
+   - Screenshot (`browser.takeScreenshot()` returns base64 PNG)
+   - DOM snapshot (`document.documentElement.outerHTML`)
+   - Spec file path
 4. Handle JSON responses and display analysis
 
 Example client usage (JavaScript):
@@ -261,7 +281,9 @@ const client = new MCPClient({
 // Analyze a failure
 const result = await client.callTool('analyze_failure', {
   console_output: testOutput,
-  spec_file_path: '/path/to/spec.ts'
+  spec_file_path: '/path/to/spec.ts',
+  screenshot_base64: await browser.takeScreenshot(),
+  dom_snapshot: await browser.execute(() => document.documentElement.outerHTML)
 });
 ```
 
