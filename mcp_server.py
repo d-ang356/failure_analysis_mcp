@@ -76,14 +76,15 @@ class Config:
 
         # Ollama Configuration
         self.ollama_host: str = os.getenv("MCP_OLLAMA_HOST", "http://localhost:11434")
-        self.ollama_model: str = os.getenv("MCP_OLLAMA_MODEL", "qwen2.5-coder:7b")
+        self.ollama_model: str = os.getenv("MCP_OLLAMA_MODEL", "gemma4:e4b")
         self.ollama_temperature: float = float(os.getenv("MCP_OLLAMA_TEMPERATURE", "0.1"))
-        self.ollama_num_ctx: int = int(os.getenv("MCP_OLLAMA_NUM_CTX", "32768"))
+        self.ollama_num_ctx: int = int(os.getenv("MCP_OLLAMA_NUM_CTX", "131072"))
         self.ollama_timeout: int = int(os.getenv("MCP_OLLAMA_TIMEOUT", "300"))
 
         # Analysis Configuration
         self.max_import_depth: int = int(os.getenv("MCP_MAX_IMPORT_DEPTH", "3"))
         self.max_file_size_kb: int = int(os.getenv("MCP_MAX_FILE_SIZE_KB", "500"))
+        self.max_dom_size_kb: int = int(os.getenv("MCP_MAX_DOM_SIZE_KB", "100"))
         self.session_ttl_minutes: int = int(os.getenv("MCP_SESSION_TTL_MINUTES", "60"))
         self.max_session_history: int = int(os.getenv("MCP_MAX_SESSION_HISTORY", "10"))
 
@@ -470,6 +471,48 @@ class CodeAnalyzer:
         return None
 
 
+def clean_dom_snapshot(dom: str, max_size_kb: int) -> str:
+    """Clean and truncate a DOM snapshot for LLM consumption.
+
+    Removes scripts, styles, and noisy attributes to reduce token count
+    while preserving structural and debugging-relevant information.
+    """
+    import re
+
+    # Remove script and style tags with their contents
+    dom = re.sub(r"<script[^>]*>.*?</script>", "", dom, flags=re.DOTALL | re.IGNORECASE)
+    dom = re.sub(r"<style[^>]*>.*?</style>", "", dom, flags=re.DOTALL | re.IGNORECASE)
+    dom = re.sub(r"<link[^>]*rel=\"stylesheet\"[^>]*>", "", dom, flags=re.IGNORECASE)
+
+    # Remove HTML comments
+    dom = re.sub(r"<!--.*?-->", "", dom, flags=re.DOTALL)
+
+    # Remove data-* attributes except data-testid and data-id
+    def clean_data_attrs(match: re.Match) -> str:
+        tag = match.group(0)
+        tag = re.sub(r'\sdata-(?!testid|id)[\w-]+="[^"]*"', "", tag)
+        tag = re.sub(r"\sdata-(?!testid|id)[\w-]+='[^']*'", "", tag)
+        return tag
+
+    dom = re.sub(r"<[^>]+>", clean_data_attrs, dom)
+
+    # Collapse excessive whitespace
+    dom = re.sub(r">\s+", ">", dom)
+    dom = re.sub(r"\s+", " ", dom)
+
+    max_chars = max_size_kb * 1024
+    if len(dom) > max_chars:
+        # Truncate, but try to keep the body if possible
+        body_match = re.search(r"(<body[^>]*>.*)", dom, re.DOTALL | re.IGNORECASE)
+        if body_match and len(body_match.group(1)) <= max_chars:
+            head = re.search(r"(<head[^>]*>.*?</head>)", dom, re.DOTALL | re.IGNORECASE)
+            head_str = head.group(1) if head else ""
+            return f"<html>{head_str}{body_match.group(1)}\n... (truncated)"
+        dom = dom[:max_chars] + "\n... (truncated)"
+
+    return dom
+
+
 def _extract_error_details(console_output: str) -> dict[str, Any]:
     """Extract error details from console output.
 
@@ -583,16 +626,64 @@ Your job is to:
 4. ANALYZE why that code caused the error
 5. PROPOSE a specific fix - point to exact file and line
 
+VISION & DOM ANALYSIS INSTRUCTIONS:
+When a screenshot is provided, EXAMINE IT CAREFULLY. The screenshot shows the exact page state at failure time. Use it to:
+- Confirm whether elements are visible, hidden, covered by modals/overlays, or missing entirely
+- Identify visual discrepancies (wrong text, wrong layout, loading spinners, error banners)
+- Verify the page title, URL bar, or any visible state that contradicts test expectations
+
+When a DOM snapshot is provided, CROSS-REFERENCE it with the selectors in the code:
+- Check if the selector from the page object actually exists in the DOM
+- Look for missing `data-testid`, `id`, or `name` attributes the selector depends on
+- Check if the element is inside an iframe, shadow DOM, or dynamically injected container
+- Verify `hidden`, `disabled`, `aria-hidden` attributes that make elements unfindable or uninteractable
+- If the error is "element not found" and the selector does not appear in the DOM, the selector is wrong or the element renders conditionally
+- If the error is "element not interactable", check the DOM for `pointer-events:none`, `opacity:0`, or parent `display:none`
+
+ELEMENT NOT FOUND — SELECTOR MISMATCH PROTOCOL (MANDATORY):
+When the error type is "Element Not Found", "Timeout" waiting for an element, or any failure involving a selector that cannot be located, you MUST follow this protocol in exact order:
+
+1. IDENTIFY the failing selector from the page object / code. Extract the exact selector string (e.g., `[data-testid="submit-btn"]`, `#username`, `.checkout-button`).
+
+2. SEARCH the provided DOM snapshot for that EXACT selector string.
+   - If found: the element exists in DOM but may be hidden, inside an iframe, or not yet rendered. Analyze timing/visibility.
+   - If NOT found: proceed to step 3 — this is a SELECTOR MISMATCH.
+
+3. SELECTOR MISMATCH DETECTED: The selector in the framework code does not match the current DOM. This IS the bug.
+   - You are FORBIDDEN from suggesting test data changes, wait times, or retry logic.
+   - The fix MUST be updating the selector in the PAGE OBJECT / framework file.
+
+4. FIND THE CORRECT SELECTOR in the DOM:
+   - Search the DOM for elements with the SAME PURPOSE / SAME VISUAL ROLE as the missing one.
+   - Look for: similar `data-testid` values (same prefix or suffix), same tag name with a nearby `id`, same `name` attribute, same CSS class, or any element that occupies the same logical position.
+   - Example: if `[data-testid="old-login"]` is missing but `[data-testid="new-login"]` exists, that is the replacement.
+   - Example: if `#submit` is missing but `<button type="submit" id="confirm">` exists, `#confirm` is the new selector.
+   - Also look for TYPO differences: `data-testid` vs `data-test-id`, camelCase vs kebab-case, missing/incorrect numbers.
+
+5. CONFIRM with the screenshot (if provided):
+   - Look at the screenshot to confirm the element IS visually present on the page.
+   - If the element is visible in the screenshot but missing from the DOM with the old selector, this proves the selector was changed/updated in the application.
+   - If the element is NOT visible in the screenshot AND not in the DOM, it may not have rendered yet (timing issue), but still check for similar selectors first.
+
+6. PROPOSE THE FIX in this exact format:
+   - File: (the page object or component file containing the old selector)
+   - Line: (exact line number)
+   - Current selector: (the old, broken selector as it appears in code)
+   - Fixed selector: (the new, correct selector found in the DOM)
+   - Explanation: Why the selector changed and how you found the new one in the DOM.
+
+STRICT RULE: If the DOM clearly shows a different selector for the same element, you MUST fix the SELECTOR in the framework code. Do NOT suggest changing the test data, adding waits, or modifying assertions.
+
 Common WebdriverIO failure patterns:
-- "element wasn't found" -> Wrong selector in page object, element not rendered yet, or in iframe
-- "element not interactable" -> Element covered by another element or not visible
+- "element wasn't found" -> Wrong selector in page object, element not rendered yet, in iframe, or selector mismatch with actual DOM
+- "element not interactable" -> Element covered by another element, not visible, or `disabled`/`pointer-events:none`
 - "stale element reference" -> DOM changed after element was located
-- "timeout" -> Element took too long to appear or action never completed
+- "timeout" -> Element took too long to appear or action never completed (check DOM first for selector mismatch before concluding timing)
 - "can't call X on element" -> Element doesn't support that method or wrong element type
 - "Expected X but got Y" -> Assertion failed, check actual vs expected values
 
 When analyzing:
-- Check if selectors in page objects match the actual DOM
+- Check if selectors in page objects match the actual DOM attributes and IDs
 - Look for missing awaits in async operations
 - Verify test data matches expected format
 - Check for timing issues or race conditions
@@ -626,9 +717,9 @@ MANDATORY: Before suggesting to change test expectations or test data:
 DO NOT simply say "change the expected value" - find the ROOT CAUSE in the code.
 
 ## Suggested Fix
-STRICT RULE: If you found ANY string concatenation, hardcoded value, or 
-transformation in a framework method (page object, util, component), you MUST 
-fix THAT code. You are FORBIDDEN from suggesting test data changes when a 
+STRICT RULE: If you found ANY string concatenation, hardcoded value, or
+transformation in a framework method (page object, util, component), you MUST
+fix THAT code. You are FORBIDDEN from suggesting test data changes when a
 framework bug exists.
 
 The fix must be in the framework file, not the test or fixture file.
@@ -637,7 +728,7 @@ The fix must be in the framework file, not the test or fixture file.
 - Current: (the buggy line as it appears in the code)
 - Fixed: (remove the concatenation/transformation)
 
-Only in case the framework file does not have bugs need fixing, focus on the spec file or test data. 
+Only in case the framework file does not have bugs need fixing, focus on the spec file or test data.
 
 ## Prevention Tips
 How to avoid similar issues in the future
@@ -689,18 +780,24 @@ class OllamaClient:
         self,
         prompt: str,
         session_history: list[dict],
+        images: list[str] | None = None,
     ) -> dict[str, Any]:
         """Analyze failure using Ollama."""
         client = await self._get_client()
 
-        # Build messages
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        messages.extend(session_history)
-        messages.append({"role": "user", "content": prompt})
+        # Build messages using ollama.Message for image support
+        from ollama import Message, Image
+
+        messages: list[Message] = [Message(role="system", content=SYSTEM_PROMPT)]
+        for hist in session_history:
+            messages.append(Message(role=hist.get("role", "user"), content=hist.get("content", "")))
+
+        ollama_images = [Image(value=img) for img in images] if images else None
+        messages.append(Message(role="user", content=prompt, images=ollama_images))
 
         # Check token estimate (rough)
         estimated_tokens = len(SYSTEM_PROMPT) + len(prompt) + sum(
-            len(m.get("content", "")) for m in session_history
+            len(m.content or "") for m in messages
         )
         estimated_tokens //= 4
 
@@ -740,9 +837,12 @@ class OllamaClient:
 
 @mcp.tool()
 async def analyze_failure(
-    console_output: str = Field(description="Raw console output from WebdriverIO test run"),
+    console_output: str = Field(description="Raw console output from WebdriverIO test run (may be ndjson lines)"),
     spec_file_path: str = Field(description="Absolute or relative path to the spec file that failed"),
     session_id: Optional[str] = Field(default=None, description="Optional session ID for maintaining context across analyses"),
+    screenshot_base64: Optional[str] = Field(default=None, description="Base64-encoded PNG/JPEG screenshot of the page at failure time"),
+    dom_snapshot: Optional[str] = Field(default=None, description="Full DOM snapshot or accessibility tree of the page at failure time"),
+    screenshot_mime_type: str = Field(default="image/png", description="MIME type of the screenshot (image/png or image/jpeg)"),
 ) -> str:
     """Analyze a WebdriverIO test failure and provide explanation with fix suggestions.
 
@@ -750,9 +850,14 @@ async def analyze_failure(
     code files (including imported page objects), and uses a local LLM to provide
     detailed analysis and fix suggestions.
 
+    When a screenshot and/or DOM snapshot are provided, the LLM will also examine the
+    visual page state and cross-reference selectors against the actual rendered DOM.
+
     The analysis includes:
     - Root cause identification from error and stack trace
     - Code context from the spec file and its imports
+    - Screenshot analysis (if provided) for visual debugging
+    - DOM snapshot cross-reference (if provided) for selector verification
     - Session-aware analysis (previous failures provide context)
     - Markdown-formatted output with code examples
 
@@ -792,6 +897,12 @@ async def analyze_failure(
             max_depth=config.max_import_depth,
         )
 
+        # Clean DOM snapshot if provided
+        cleaned_dom = ""
+        if dom_snapshot:
+            cleaned_dom = clean_dom_snapshot(dom_snapshot, config.max_dom_size_kb)
+            logger.info(f"DOM snapshot cleaned: {len(dom_snapshot)} -> {len(cleaned_dom)} chars")
+
         # Build prompt - put ERROR DETAILS first and prominently
         prompt_lines = ["# WebdriverIO Test Failure Analysis\n"]
 
@@ -816,6 +927,28 @@ async def analyze_failure(
         if session_context:
             prompt_lines.append("## Session Context")
             prompt_lines.append(session_context)
+            prompt_lines.append("")
+
+        # Add screenshot analysis section (image sent separately via Ollama API)
+        if screenshot_base64:
+            prompt_lines.append("## Screenshot Analysis")
+            prompt_lines.append(
+                "A screenshot of the page at failure time is attached above. "
+                "Examine it carefully for visual discrepancies, missing elements, overlays, "
+                "or incorrect page state."
+            )
+            prompt_lines.append("")
+
+        # Add DOM snapshot section
+        if cleaned_dom:
+            prompt_lines.append("## DOM Snapshot (Cleaned)")
+            prompt_lines.append(
+                "Use the DOM below to cross-reference selectors from the code. "
+                "Check for missing elements, wrong attributes, hidden states, or iframe containers."
+            )
+            prompt_lines.append("```html")
+            prompt_lines.append(cleaned_dom)
+            prompt_lines.append("```")
             prompt_lines.append("")
 
         # Add relevant code files (prioritize files mentioned in stack trace)
@@ -861,10 +994,17 @@ async def analyze_failure(
                 "session_id": session_id,
             })
 
+        # Prepare images for vision analysis
+        images: list[str] = []
+        if screenshot_base64:
+            images.append(screenshot_base64)
+            logger.info(f"Including screenshot in analysis ({len(screenshot_base64)} base64 chars, mime={screenshot_mime_type})")
+
         # Get analysis from LLM
         response = await llm_client.analyze(
             prompt=prompt,
             session_history=session.conversation_history,
+            images=images if images else None,
         )
 
         # Update session with this failure
@@ -972,6 +1112,7 @@ def get_current_config() -> str:
     lines.append(f"\n## Analysis Settings")
     lines.append(f"- **Max Import Depth**: {config.max_import_depth}")
     lines.append(f"- **Max File Size**: {config.max_file_size_kb}KB")
+    lines.append(f"- **Max DOM Size**: {config.max_dom_size_kb}KB")
     lines.append(f"\n## Session Settings")
     lines.append(f"- **Session TTL**: {config.session_ttl_minutes}min")
     lines.append(f"- **Max History**: {config.max_session_history}")
@@ -990,6 +1131,8 @@ def main() -> None:
     logger.info(f"MCP Client URL: {config.mcp_client_url}:{config.mcp_client_port}")
     logger.info(f"Ollama host: {config.ollama_host}")
     logger.info(f"Model: {config.ollama_model}")
+    logger.info(f"Context window: {config.ollama_num_ctx}")
+    logger.info(f"Max DOM size: {config.max_dom_size_kb}KB")
     logger.info(f"Log level: {logging.getLevelName(logger.level)}")
 
     mcp.run(transport="stdio")
